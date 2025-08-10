@@ -1,0 +1,216 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"syscall"
+	"time"
+
+	"github.com/sevlyar/go-daemon"
+)
+
+
+const (
+    PROCNAME = "altervoice"
+    PIDFILE = "/var/run/altervoice.pid"
+    LOGFILE = "/tmp/altervoice.log"
+)
+
+type dae struct {
+    pidfile string 
+    logfile string
+    curdir string
+}
+
+type startarg struct {
+    Addr string
+    Port string
+    DebugFlag int
+}
+
+
+var instance_process  = startarg{
+    Addr: "0.0.0.0",
+    Port: "9000",
+    DebugFlag: 0,
+}
+
+func IsFileExits(filename string) bool {
+    if _,err := os.Stat(filename); err != nil {
+        if os.IsNotExist(err) {
+            return false
+        }
+    }
+
+    return true
+}
+
+func (d *dae)looptask() (err error) {
+    router := newRouter()
+    
+    srv := &http.Server{
+        Addr: instance_process.Addr + ":" + instance_process.Port,
+        Handler: router,
+    }
+
+    err = srv.ListenAndServe()
+    if err != nil {
+        return err
+    }
+
+    return nil
+}
+
+func (d *dae) daemond() error {
+    cntxt :=  &daemon.Context{
+        PidFileName: d.pidfile,
+        PidFilePerm: 0644,
+        LogFileName: "",
+        LogFilePerm: 0,
+        WorkDir: d.curdir,
+        Umask: 027,
+    }
+
+    _, err := cntxt.Reborn()
+
+    defer cntxt.Release()
+
+    if err != nil {
+        log.Printf("Reborn() failed\n")
+        return err
+    }
+
+    return nil
+
+}
+
+func (d *dae) start() (err error){
+    if err = InitLog(); err != nil {
+        log.Printf("[initlog] failed\n")
+        return err
+    }
+
+    if err = d.daemond(); err != nil {
+        LogPrint(LEVEL_FATAL,"[daemond] failed:%s\n",err.Error())
+        return err
+    }
+
+    if err = d.looptask(); err != nil {
+        LogPrint(LEVEL_FATAL,"[looptask] failed:%s\n",err.Error())
+        return err
+    }
+
+    return nil
+
+}
+
+func (d *dae) stop() (err error){
+    fp,err := os.Open(d.pidfile)
+
+    if err != nil {
+        LogPrint(LEVEL_ERROR,"[stop] failed:%s\n",err.Error())
+        return err
+    }
+
+    var pid int
+
+    if _,err := fmt.Fscanf(fp,"%d",&pid); err != nil {
+        LogPrint(LEVEL_ERROR,"[stop] failed:%s",err.Error())
+        return err
+    }
+
+    for{
+        if err = syscall.Kill(pid,syscall.SIGKILL); err == syscall.ENOENT{
+            break
+        }
+        time.Sleep(1*time.Second)
+    }
+
+    return nil
+}
+
+func (d *dae) status() (err error) {
+    var pid string
+    if IsFileExits(d.pidfile) {
+        fp,err := os.Open(d.pidfile)
+
+        if err != nil {
+            fmt.Fprintf(os.Stdin,"\033[1;5;31m%s Status\033[0m:\ncheck status failed:%s\n",PROCNAME,err.Error())
+            return err
+        }
+        
+        fmt.Fscanf(fp,"%s",&pid)
+
+        var procname string
+
+        fp1,err1 := os.Open("/proc/"+pid+"comm")
+
+        if err1 == nil {
+            fmt.Fscanf(fp1,"%s",&procname)
+            if procname == PROCNAME {
+                fmt.Fprintf(os.Stdout,"%s Status:\n\tthe status:running\n")
+            }
+
+            fmt.Fprintf(os.Stdout,"\033[1;5;31m%s Status\033[0m:\n%s is already exits\n",PROCNAME,PROCNAME)
+        }
+
+        fmt.Fprintf(os.Stdout,"\033[1;5;31m%s Status\033[0m:\n%s is already exits\n",PROCNAME,PROCNAME)
+        return err1 
+    }
+
+    fmt.Fprintf(os.Stdout,"%s Status:\n\tthe status:stopped\n")
+    
+    return nil
+}
+
+func (d *dae) restart() (err error){
+    if err = d.stop(); err != nil {
+        return err
+    }
+
+    if err = d.start(); err != nil {
+        return err
+
+    }
+
+    return nil
+}
+
+func usage() {
+    fmt.Fprintf(os.Stdout,"\033[1;5;31musage\033[0m:\n%s [start | stop | restart | status]\n",PROCNAME)
+    os.Exit(1)
+}
+
+func main() {
+    d := &dae{
+        pidfile: PIDFILE,
+        logfile: LOGFILE,
+        curdir: "/",
+    }
+
+    if len(os.Args) == 1 {
+        usage()
+    }else if os.Args[1] == "start" {
+        if err := d.start(); err != nil {
+            os.Exit(1)
+        }         
+    }else if os.Args[1] == "stop" {
+        if err := d.stop(); err != nil {
+            os.Exit(1)
+        }
+        os.Exit(0)
+    }else if os.Args[1] == "status" {
+        if err := d.status(); err != nil {
+            os.Exit(1)
+        }
+        os.Exit(0)
+    }else if os.Args[1] == "restart" {
+        if err := d.restart(); err != nil {
+            os.Exit(1)
+        }
+    }else {
+        usage()
+    }
+}

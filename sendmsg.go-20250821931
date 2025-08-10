@@ -1,0 +1,197 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+    "encoding/json"
+	"github.com/larksuite/oapi-sdk-go/v3"
+	"github.com/larksuite/oapi-sdk-go/v3/core"
+	"github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+)
+
+// 全局样式结构体定义（所有元素共用同一类型）
+type ElementStyle struct {
+	Color      string `json:"color,omitempty"`
+	FontSize   string `json:"font_size,omitempty"`
+	FontWeight string `json:"font_weight_weight,omitempty"`
+}
+
+// 文本元素结构体（明确字段类型）
+type TextElement struct {
+	Tag     string       `json:"tag"`
+	Content string       `json:"content"`
+	Lines   int          `json:"lines"` // 必须包含行数，无omitempty
+	Style   ElementStyle `json:"style,omitempty"`
+}
+
+// 飞书卡片完整结构
+type CardContent struct {
+	Config struct {
+		WideScreenMode bool `json:"wide_screen_mode"`
+	} `json:"config"`
+	Header struct {
+		Title struct {
+			Tag     string `json:"tag"`
+			Content string `json:"content"`
+		} `json:"title"`
+		Template string `json:"template"`
+	} `json:"header"`
+	Elements []struct {
+		Tag      string       `json:"tag"`
+		Elements []TextElement `json:"elements"`
+	} `json:"elements"`
+}
+
+func SendMsg(reqbody []byte) (string, error) {
+	// 1. 验证输入内容
+	if len(reqbody) == 0 {
+		return "", errors.New("请求内容为空")
+	}
+
+	// 2. 格式化JSON内容（确保有足够内容显示30行）
+	var prettyJSON interface{}
+	if err := json.Unmarshal(reqbody, &prettyJSON); err != nil {
+		return "", fmt.Errorf("内容格式错误: %v", err)
+	}
+	formattedJSON, err := json.MarshalIndent(prettyJSON, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("JSON格式化失败: %v", err)
+	}
+
+	// 3. 确保JSON内容至少有30行（不足时补充空行）
+	jsonStr := string(formattedJSON)
+	lineCount := 1
+	for _, c := range jsonStr {
+		if c == '\n' {
+			lineCount++
+		}
+	}
+	if lineCount < 30 {
+		for i := lineCount; i < 30; i++ {
+			jsonStr += "\n  // 补充显示行"
+		}
+	}
+
+	// 4. 构建文本元素（使用统一结构体类型）
+	textElements := []TextElement{
+		{
+			Tag:     "text",
+			Content: "告警详情",
+			Lines:   1,
+			Style: ElementStyle{
+				Color:      "red",
+				FontSize:   "14px",
+				FontWeight: "bold",
+			},
+		},
+		{
+			Tag:     "text",
+			Content: "\n以下是系统检测到的告警数据：\n",
+			Lines:   2,
+			Style:   ElementStyle{}, // 空样式也使用统一类型
+		},
+		{
+			Tag:     "text",
+			Content: "```json\n" + jsonStr + "\n```", // 明确代码块格式
+			Lines:   30, // 强制30行，此字段会被序列化
+			Style: ElementStyle{
+				FontSize: "12px",
+			},
+		},
+		{
+			Tag:     "text",
+			Content: "\n**处理建议**：\n1. 登录监控系统确认状态\n2. 检查主机资源使用情况\n3. 必要时触发应急预案",
+			Lines:   5,
+			Style: ElementStyle{
+				FontWeight: "bold",
+			},
+		},
+	}
+
+	// 5. 构建完整卡片
+	card := CardContent{
+		Config: struct {
+			WideScreenMode bool `json:"wide_screen_mode"`
+		}{WideScreenMode: true},
+		Header: struct {
+			Title struct {
+				Tag     string `json:"tag"`
+				Content string `json:"content"`
+			} `json:"title"`
+			Template string `json:"template"`
+		}{
+			Title: struct {
+				Tag     string `json:"tag"`
+				Content string `json:"content"`
+			}{Tag: "plain_text", Content: "重要告警通知"},
+			Template: "yellow",
+		},
+		Elements: []struct {
+			Tag      string       `json:"tag"`
+			Elements []TextElement `json:"elements"`
+		}{
+			{
+				Tag:      "column_set",
+				Elements: textElements,
+			},
+		},
+	}
+
+	// 6. 序列化卡片并验证
+	cardJSON, err := json.MarshalIndent(card, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("卡片序列化失败: %v", err)
+	}
+
+	// 调试：检查lines字段是否存在（生产环境可删除）
+	fmt.Println("生成的卡片JSON片段:")
+	fmt.Println("代码块元素:", string(cardJSON))
+
+	// 5、创建 Client
+	client := lark.NewClient(appconfig.AppID, appconfig.AppSecret)
+	// 6、创建请求对象
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(`chat_id`).
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(appconfig.Chat_Id).
+			//MsgType(`text`).
+			//Content(fmt.Sprintf(`{"text":%q}`,string(reqbody))).
+			MsgType("interactive").
+			Content(string(cardJSON)).
+			Uuid(``).
+			Build()).
+		Build()
+
+	// 7、发起请求
+	resp, err := client.Im.V1.Message.Create(context.Background(), req)
+
+	// 8、处理错误
+	if err != nil {
+        LogPrint(LEVEL_FATAL,"resp failed,the error is %v\n",err)
+		return "",errors.New("response failed")
+	}
+
+	// 9、服务端错误处理
+	if !resp.Success() {
+		LogPrint(LEVEL_FATAL,"logId: %s, error response: \n%s", resp.RequestId(), larkcore.Prettify(resp.CodeError))
+		return "",errors.New("response failed")
+	}
+
+	// 10、业务处理
+	LogPrint(LEVEL_INFO,"the response is %s\n",larkcore.Prettify(resp))
+    
+    re := regexp.MustCompile(`MessageId:\s*"([^"]+)"`)
+    // 11、查找匹配的内容
+    matches := re.FindStringSubmatch(larkcore.Prettify(resp))
+    if len(matches) >= 2 {
+        messageId := matches[1]
+        LogPrint(LEVEL_INFO,"提取到的 MessageId 值为：%s\n", messageId)
+        return messageId,nil
+    } else {
+        LogPrint(LEVEL_FATAL,"未找到 MessageId 对应的内容")
+        return "",errors.New("not found the MessageId")
+    }
+
+}
